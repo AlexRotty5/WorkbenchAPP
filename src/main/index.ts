@@ -22,8 +22,22 @@ import { detectObject } from './openai'
 import { IPC } from '../shared/types'
 import type { InsertResult, ScanCompletePayload, ScanRecord } from '../shared/types'
 
-// Load OPENAI_API_KEY from the project root .env, in the MAIN process only.
+// Load OPENAI_API_KEY in the MAIN process only.
+// In dev this comes from the project-root .env (cwd). A packaged app launched
+// from /Applications has no project root, so we also read a stable per-user
+// config file at ~/Library/Application Support/Workbench Vision/.env.
 loadEnv()
+
+function loadUserEnv(): void {
+  try {
+    const userEnv = join(app.getPath('userData'), '.env')
+    if (existsSync(userEnv)) {
+      loadEnv({ path: userEnv })
+    }
+  } catch {
+    // best-effort; getClient() will surface a friendly message if the key is missing
+  }
+}
 
 const execFileAsync = promisify(execFile)
 const isDev = !app.isPackaged
@@ -391,28 +405,53 @@ function setupMediaPermissions(): void {
 /* Menu-bar tray                                                       */
 /* ------------------------------------------------------------------ */
 
-// Build a small template icon (a camera "lens" ring) at runtime so we don't
-// need to ship an asset. Template images are recolored by macOS for the menu
-// bar automatically.
+// Build a small template icon (a simple camera silhouette) at runtime so we
+// don't need to ship an asset. Template images are pure black + alpha; macOS
+// recolors them for the menu bar (and dark mode) automatically.
 function buildTrayIcon(): NativeImage {
-  const size = 32
+  const size = 36
   const buf = Buffer.alloc(size * size * 4)
+
+  // Camera body (rounded rectangle) + viewfinder bump on top.
+  const bodyL = 4
+  const bodyR = size - 4
+  const bodyT = 13
+  const bodyB = size - 6
+  const bodyRad = 4
+  const bumpL = size * 0.38
+  const bumpR = size * 0.62
+  const bumpT = 9
+
+  // Lens: a ring (hole in the middle reads as the lens opening).
   const cx = size / 2
-  const cy = size / 2
-  const rOuter = size * 0.36
-  const rInner = size * 0.18
+  const cy = (bodyT + bodyB) / 2
+  const lensHole = size * 0.13
+
+  const inRoundedRect = (x: number, y: number): boolean => {
+    if (x < bodyL || x > bodyR || y < bodyT || y > bodyB) return false
+    const dx = Math.max(bodyL + bodyRad - x, 0, x - (bodyR - bodyRad))
+    const dy = Math.max(bodyT + bodyRad - y, 0, y - (bodyB - bodyRad))
+    return dx * dx + dy * dy <= bodyRad * bodyRad
+  }
+
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
+      const px = x + 0.5
+      const py = y + 0.5
+      const inBody = inRoundedRect(px, py)
+      const inBump = px >= bumpL && px <= bumpR && py >= bumpT && py < bodyT
+      let solid = inBody || inBump
+      // Carve out the lens opening.
+      if (Math.hypot(px - cx, py - cy) < lensHole) solid = false
+
       const i = (y * size + x) * 4
-      const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy)
-      const inRing = d <= rOuter && d >= rInner
-      const a = inRing ? 255 : 0
       buf[i] = 0
       buf[i + 1] = 0
       buf[i + 2] = 0
-      buf[i + 3] = a
+      buf[i + 3] = solid ? 255 : 0
     }
   }
+
   const img = nativeImage.createFromBitmap(buf, { width: size, height: size, scaleFactor: 2 })
   img.setTemplateImage(true)
   return img
@@ -505,9 +544,15 @@ function registerGlobalShortcut(): void {
 
 app.whenReady().then(() => {
   if (process.platform === 'darwin') {
+    // Show in the Dock (with our app icon) in addition to the menu bar.
+    // Forced explicitly so a stale Launch Services "UIElement" registration
+    // can't keep the app out of the Dock.
+    app.setActivationPolicy('regular')
+    app.dock?.show()
     app.setAboutPanelOptions({ applicationName: 'Workbench Vision' })
   }
 
+  loadUserEnv()
   ensureStorage()
   setupMediaPermissions()
   void ensureCameraAccess()

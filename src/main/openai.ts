@@ -4,8 +4,9 @@ import type { DetectResult } from '../shared/types'
 const MODEL = 'gpt-4o'
 
 const MISSING_KEY_MESSAGE =
-  'No OpenAI API key found. Create a .env file in the project root with ' +
-  'OPENAI_API_KEY=sk-... (you can copy .env.example), then restart the app.'
+  'No OpenAI API key found. Add OPENAI_API_KEY=sk-... to a .env file ' +
+  '(the project root in dev, or "~/Library/Application Support/Workbench Vision/.env" ' +
+  'for the installed app), then restart Workbench Vision.'
 
 let client: OpenAI | null = null
 
