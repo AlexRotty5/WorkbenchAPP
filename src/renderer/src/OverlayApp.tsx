@@ -558,7 +558,7 @@ function OverlayApp(): JSX.Element {
                 <span className="pill-icon">
                   <CameraIcon />
                 </span>
-                <span className="pill-text">Open Workbench Vision</span>
+                <span className="pill-text">Open app</span>
               </span>
             )}
           </div>

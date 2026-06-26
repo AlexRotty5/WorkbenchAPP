@@ -490,7 +490,8 @@ kbd {
   display: flex;
   align-items: flex-end;
   justify-content: center;
-  padding-bottom: 0;
+  padding-bottom: 6px;
+  transform: translateX(-22px);
 }
 
 .pill {
@@ -498,9 +499,9 @@ kbd {
   align-items: center;
   justify-content: center;
   gap: 9px;
-  height: 36px;
-  max-width: 260px;
-  padding: 0 15px;
+  height: 39px;
+  max-width: 278px;
+  padding: 0 17px;
   border-radius: 999px;
   overflow: hidden;
   white-space: nowrap;
@@ -520,14 +521,14 @@ kbd {
   display: inline-flex;
   align-items: flex-end;
   justify-content: center;
-  padding: 18px 34px 0;
+  padding: 18px 34px 2px;
 }
 
 /* Resting state: a tiny, quiet, black bar. */
 .pill.standby {
-  height: 6px;
-  width: 30px;
-  max-width: 30px;
+  height: 7px;
+  width: 32px;
+  max-width: 32px;
   padding: 0;
   gap: 0;
   background: rgba(0, 0, 0, 0.85);
@@ -537,15 +538,19 @@ kbd {
 
 /* Hover: expand into a clickable launcher, Wispr-Flow style. */
 .pill.standby.hover {
-  height: 34px;
+  height: 37px;
   width: auto;
-  max-width: 240px;
-  padding: 0 15px;
+  max-width: 148px;
+  padding: 0 14px;
   gap: 9px;
   background: rgba(12, 13, 17, 0.92);
   border-color: rgba(255, 255, 255, 0.1);
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
   cursor: pointer;
+}
+
+.pill.standby.hover .pill-text {
+  max-width: 96px;
 }
 
 .pill-content {
@@ -583,7 +588,7 @@ kbd {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 188px;
+  max-width: 204px;
 }
 
 .pill-spinner {
