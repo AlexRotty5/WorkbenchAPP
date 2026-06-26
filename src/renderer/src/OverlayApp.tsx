@@ -283,7 +283,11 @@ function OverlayApp(): JSX.Element {
       })
 
       if (result.ok && result.found) {
-        finishWithSuccess(result.insertLabel || result.label, sessionGen)
+        if (result.inserted) {
+          finishWithSuccess(result.insertLabel || result.label, sessionGen)
+        } else {
+          finishWithError('Turn on auto-insert', 1800, sessionGen)
+        }
         return
       }
 

@@ -14,7 +14,7 @@
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "start": "electron-vite preview",
     "preview": "electron-vite preview",
-    "package:mac": "npm run build && electron-builder --mac"
+    "package:mac": "npm run build && electron-builder --mac && bash scripts/sign-mac-app.sh"
   },
   "build": {
     "appId": "com.workbench.vision",
@@ -27,15 +27,23 @@
       "out/**/*",
       "package.json"
     ],
+    "asarUnpack": [
+      "node_modules/@jitsi/robotjs/**"
+    ],
     "mac": {
       "category": "public.app-category.productivity",
       "icon": "build/icon.icns",
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "hardenedRuntime": false,
       "target": [
         "dmg",
         "zip"
       ],
       "extendInfo": {
-        "NSCameraUsageDescription": "Workbench Vision uses your camera so you can capture a single frame of a physical object to analyze. The live feed stays on your device; nothing is sent until you press Analyze Object."
+        "NSCameraUsageDescription": "Workbench Vision uses your camera so you can capture a single frame of a physical object to analyze. The live feed stays on your device; nothing is sent until you press Analyze Object.",
+        "NSAppleEventsUsageDescription": "Workbench Vision pastes scanned photos and labels into the app you are typing in, such as ChatGPT or a browser.",
+        "NSAccessibilityUsageDescription": "Workbench Vision uses Accessibility to paste scanned photos and labels into the text field you are typing in."
       }
     }
   },
@@ -51,6 +59,7 @@
     "vite": "^7.3.6"
   },
   "dependencies": {
+    "@jitsi/robotjs": "^0.6.22",
     "dotenv": "^17.4.2",
     "openai": "^6.45.0",
     "react": "^19.2.7",

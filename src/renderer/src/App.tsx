@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { JSX } from 'react'
-import type { ScanRecord } from '../../shared/types'
+import type { AutoInsertPermissionStatus, BuildInfo, ScanRecord } from '../../shared/types'
 
 function timeAgo(ts: number): string {
   const diff = Date.now() - ts
@@ -17,15 +17,17 @@ function timeAgo(ts: number): string {
 
 function App(): JSX.Element {
   const [scans, setScans] = useState<ScanRecord[]>([])
-  const [accessible, setAccessible] = useState<boolean | null>(null)
+  const [perm, setPerm] = useState<AutoInsertPermissionStatus | null>(null)
+  const [buildInfo, setBuildInfo] = useState<BuildInfo | null>(null)
   const [copiedId, setCopiedId] = useState<string | null>(null)
 
   useEffect(() => {
     void window.api.getScans().then(setScans)
-    void window.api.recheckAccessibility().then(setAccessible)
+    void window.api.recheckAccessibility().then(setPerm)
+    void window.api.getBuildInfo().then(setBuildInfo)
 
     const offScans = window.api.onScansUpdated(setScans)
-    const offAccess = window.api.onAccessibilityUpdated(setAccessible)
+    const offAccess = window.api.onAccessibilityUpdated(setPerm)
     return () => {
       offScans()
       offAccess()
@@ -49,11 +51,11 @@ function App(): JSX.Element {
   }
 
   async function enableAccessibility(): Promise<void> {
-    setAccessible(await window.api.requestAccessibility())
+    setPerm(await window.api.requestAccessibility())
   }
 
   async function recheckAccessibility(): Promise<void> {
-    setAccessible(await window.api.recheckAccessibility())
+    setPerm(await window.api.recheckAccessibility())
   }
 
   return (
@@ -79,7 +81,7 @@ function App(): JSX.Element {
         it and drops the image plus a short label straight into your active field.
       </div>
 
-      {accessible === null && (
+      {perm === null && (
         <div className="access-banner access-banner--unknown">
           <div>Checking auto-insert permissions…</div>
           <button className="btn ghost" onClick={() => void recheckAccessibility()}>
@@ -88,12 +90,12 @@ function App(): JSX.Element {
         </div>
       )}
 
-      {accessible === false && (
+      {perm !== null && !perm.ready && (
         <div className="access-banner">
           <div>
-            <strong>Auto-insert is off.</strong> Grant Accessibility permission so scans can be
-            typed into other apps. Until then, the scanned image is copied to your clipboard so you
-            can paste it manually.
+            <strong>Auto-insert is off.</strong>{' '}
+            {perm.hint ??
+              'Enable Workbench Vision under Accessibility and Automation in System Settings.'}
           </div>
           <div className="access-banner-actions">
             <button className="btn primary" onClick={() => void enableAccessibility()}>
@@ -154,6 +156,13 @@ function App(): JSX.Element {
           </div>
         )}
       </section>
+
+      {buildInfo && (
+        <footer className="app-footer">
+          Build {buildInfo.buildId}
+          {buildInfo.packaged ? ' · packaged' : ' · dev'}
+        </footer>
+      )}
     </div>
   )
 }

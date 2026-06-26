@@ -1,6 +1,8 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { IPC } from '../shared/types'
 import type {
+  AutoInsertPermissionStatus,
+  BuildInfo,
   InsertResult,
   RunScanPayload,
   RunScanResult,
@@ -63,19 +65,23 @@ const api = {
   },
 
   // ----- Accessibility (auto-insert permission) -----
-  getAccessibility(): Promise<boolean> {
+  getAccessibility(): Promise<AutoInsertPermissionStatus> {
     return ipcRenderer.invoke(IPC.getAccessibility)
   },
-  requestAccessibility(): Promise<boolean> {
+  requestAccessibility(): Promise<AutoInsertPermissionStatus> {
     return ipcRenderer.invoke(IPC.requestAccessibility)
   },
-  recheckAccessibility(): Promise<boolean> {
+  recheckAccessibility(): Promise<AutoInsertPermissionStatus> {
     return ipcRenderer.invoke(IPC.recheckAccessibility)
   },
-  onAccessibilityUpdated(cb: (trusted: boolean) => void): () => void {
-    const listener = (_e: unknown, trusted: boolean): void => cb(trusted)
+  onAccessibilityUpdated(cb: (status: AutoInsertPermissionStatus) => void): () => void {
+    const listener = (_e: unknown, status: AutoInsertPermissionStatus): void => cb(status)
     ipcRenderer.on(IPC.accessibilityUpdated, listener)
     return () => ipcRenderer.removeListener(IPC.accessibilityUpdated, listener)
+  },
+
+  getBuildInfo(): Promise<BuildInfo> {
+    return ipcRenderer.invoke(IPC.getBuildInfo)
   }
 }
 

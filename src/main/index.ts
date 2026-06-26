@@ -1,6 +1,6 @@
 import { join } from 'path'
 import { createHash } from 'crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, appendFileSync } from 'fs'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { config as loadEnv } from 'dotenv'
@@ -22,6 +22,8 @@ import type { NativeImage } from 'electron'
 import { detectObject } from './openai'
 import { IPC } from '../shared/types'
 import type {
+  AutoInsertPermissionStatus,
+  BuildInfo,
   DetectObjectPayload,
   DetectResult,
   InsertResult,
@@ -31,6 +33,42 @@ import type {
   ScanRecord
 } from '../shared/types'
 import { scanLog } from '../shared/scanLog'
+import { BUILD_ID } from '../shared/buildInfo'
+
+const OSASCRIPT = '/usr/bin/osascript'
+
+type RobotModule = {
+  keyTap(key: string, modifier?: string | string[]): void
+  setKeyboardDelay(ms: number): void
+  typeString(text: string): void
+}
+
+let robotKeyboard: RobotModule | null = null
+
+function loadRobotKeyboard(): RobotModule | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return require('@jitsi/robotjs') as RobotModule
+  } catch (primaryErr) {
+    if (app.isPackaged) {
+      try {
+        const unpacked = join(
+          process.resourcesPath,
+          'app.asar.unpacked',
+          'node_modules',
+          '@jitsi',
+          'robotjs'
+        )
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        return require(unpacked) as RobotModule
+      } catch {
+        /* fall through */
+      }
+    }
+    console.warn('[scan] robotjs-unavailable', primaryErr)
+    return null
+  }
+}
 
 // Load OPENAI_API_KEY in the MAIN process only.
 // In dev this comes from the project-root .env (cwd). A packaged app launched
@@ -72,8 +110,7 @@ let activeOverlaySessionScanId: string | null = null
 /** Scan ID that already produced the one allowed card+insert for this hotkey session. */
 let sessionCommittedScanId: string | null = null
 let lastGlobalInsertAt = 0
-let accessibilityVerifiedByInsert = false
-let lastSuccessfulInsertAt = 0
+let automationOk = false
 let ipcRegistered = false
 let shortcutRegistered = false
 
@@ -241,27 +278,178 @@ function diskMarkInserted(): void {
   writeDiskScanLock({ ...disk, lastInsertAt: Date.now() })
 }
 
-function getAccessibilityStatus(): boolean {
+function macAccessibilityTrusted(): boolean {
   if (process.platform !== 'darwin') return true
   try {
-    if (systemPreferences.isTrustedAccessibilityClient(false)) return true
+    return systemPreferences.isTrustedAccessibilityClient(false)
   } catch {
-    /* fall through */
+    return false
   }
-  // macOS sometimes reports false even when paste works; trust a recent successful insert.
-  if (accessibilityVerifiedByInsert && Date.now() - lastSuccessfulInsertAt < 7 * 86400000) {
+}
+
+function getAccessibilityStatus(): boolean {
+  return macAccessibilityTrusted()
+}
+
+let insertTargetApp: string | null = null
+
+const INSERT_TARGET_SKIP = new Set(['Workbench Vision', 'Electron'])
+
+async function queryFrontmostApp(): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(OSASCRIPT, [
+      '-e',
+      'tell application "System Events" to return name of first application process whose frontmost is true'
+    ])
+    const name = stdout.trim()
+    return name || null
+  } catch {
+    return null
+  }
+}
+
+function captureInsertTargetApp(): void {
+  void queryFrontmostApp().then((name) => {
+    if (name && !INSERT_TARGET_SKIP.has(name)) {
+      insertTargetApp = name
+      logScan('insert-target-captured', 'system', { app: name })
+    }
+  })
+}
+
+async function focusInsertTarget(): Promise<void> {
+  let name = insertTargetApp
+  if (!name || INSERT_TARGET_SKIP.has(name)) {
+    const front = await queryFrontmostApp()
+    if (front && !INSERT_TARGET_SKIP.has(front)) name = front
+  }
+  if (!name || INSERT_TARGET_SKIP.has(name)) return
+
+  const escaped = name.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  try {
+    // Bring the target app forward without a full activate (preserves text-field focus).
+    await execFileAsync(OSASCRIPT, [
+      '-e',
+      `tell application "System Events" to tell process "${escaped}" to set frontmost to true`
+    ])
+    await delay(450)
+    logScan('insert-target-focused', 'system', { app: name })
+  } catch (err) {
+    try {
+      await execFileAsync(OSASCRIPT, ['-e', `tell application "${escaped}" to activate`])
+      await delay(450)
+      logScan('insert-target-focused', 'system', { app: name, fallback: 'activate' })
+    } catch (err2) {
+      logScan('insert-target-focus-failed', 'system', {
+        app: name,
+        error: err2 instanceof Error ? err2.message : String(err2)
+      })
+    }
+  }
+}
+
+async function ensureAccessibilityPermission(prompt: boolean): Promise<boolean> {
+  if (macAccessibilityTrusted()) return true
+  if (!prompt) return false
+  try {
+    systemPreferences.isTrustedAccessibilityClient(true)
+  } catch {
+    /* ignore */
+  }
+  await delay(900)
+  return macAccessibilityTrusted()
+}
+
+
+function appendInsertDebug(message: string, extra: Record<string, unknown> = {}): void {
+  try {
+    const line = `${new Date().toISOString()} ${message} ${JSON.stringify(extra)}\n`
+    appendFileSync(join(app.getPath('userData'), 'insert-debug.log'), line, 'utf-8')
+  } catch {
+    /* ignore */
+  }
+}
+
+async function refreshAutomationStatus(retries = 3): Promise<boolean> {
+  if (process.platform !== 'darwin') {
+    automationOk = true
     return true
   }
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      await execFileAsync(OSASCRIPT, [
+        '-e',
+        'tell application "System Events" to return name of first application process whose frontmost is true'
+      ])
+      automationOk = true
+      return true
+    } catch (err) {
+      logScan('automation-check-failed', 'system', {
+        attempt: attempt + 1,
+        error: err instanceof Error ? err.message : String(err)
+      })
+      if (attempt < retries - 1) await delay(400)
+    }
+  }
+  automationOk = false
   return false
 }
 
+function getAutoInsertReady(): boolean {
+  if (process.platform !== 'darwin') return true
+  return macAccessibilityTrusted()
+}
+
+async function getPermissionStatus(): Promise<AutoInsertPermissionStatus> {
+  const axTrusted = macAccessibilityTrusted()
+  await refreshAutomationStatus()
+  const automation = automationOk
+  const ready = getAutoInsertReady()
+
+  let hint: string | undefined
+  if (!ready) {
+    const appPath = app.isPackaged ? app.getPath('exe') : undefined
+    if (!axTrusted) {
+      hint =
+        'Turn on Workbench Vision under System Settings → Privacy & Security → Accessibility. ' +
+        'Remove any old Workbench Vision entry, click +, choose /Applications/Workbench Vision.app, ' +
+        'toggle it on, then quit (⌘Q) and reopen this app.'
+      if (appPath) hint += ` (${appPath})`
+    } else if (!automation) {
+      hint =
+        'Allow Workbench Vision to control System Events under Automation, then quit and reopen the app.'
+    }
+  }
+
+  return {
+    ready,
+    accessibility: axTrusted,
+    automation,
+    hint
+  }
+}
+
+function openAccessibilitySettings(): void {
+  void shell.openExternal(
+    'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'
+  )
+}
+
+function openAutomationSettings(): void {
+  void shell.openExternal(
+    'x-apple.systempreferences:com.apple.preference.security?Privacy_Automation'
+  )
+}
+
 function notifyAccessibilityStatus(): void {
-  mainWindow?.webContents.send(IPC.accessibilityUpdated, getAccessibilityStatus())
+  void getPermissionStatus().then((status) => {
+    mainWindow?.webContents.send(IPC.accessibilityUpdated, status)
+  })
 }
 
 function markAccessibilityWorking(): void {
-  accessibilityVerifiedByInsert = true
-  lastSuccessfulInsertAt = Date.now()
+  if (!macAccessibilityTrusted()) return
+  automationOk = true
   notifyAccessibilityStatus()
 }
 
@@ -555,8 +743,12 @@ async function executeRunScan(payload: RunScanPayload): Promise<RunScanResult> {
     const insertResult = await insertIntoActiveField(completePayload)
     if (insertResult.duplicate) {
       logScan('auto-insert-skipped-duplicate', scanId, { duplicate: true })
-    } else if (insertResult.inserted) {
-      markAccessibilityWorking()
+    } else if (!insertResult.inserted) {
+      logScan('auto-insert-failed', scanId, {
+        inserted: false,
+        error: insertResult.error,
+        accessibility: insertResult.accessibility
+      })
     }
 
     return {
@@ -587,10 +779,35 @@ function accessibilityTrusted(prompt = false): boolean {
 }
 
 async function pressCmdV(): Promise<void> {
-  await execFileAsync('osascript', [
-    '-e',
-    'tell application "System Events" to keystroke "v" using command down'
-  ])
+  try {
+    await execFileAsync(OSASCRIPT, [
+      '-e',
+      'tell application "System Events" to keystroke "v" using command down'
+    ])
+  } catch (err) {
+    if (robotKeyboard) {
+      robotKeyboard.keyTap('v', 'command')
+      return
+    }
+    throw err
+  }
+}
+
+async function typeLabelIntoField(labelText: string): Promise<void> {
+  const escaped = labelText.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  try {
+    await execFileAsync(OSASCRIPT, [
+      '-e',
+      `tell application "System Events" to keystroke "${escaped}"`
+    ])
+  } catch (err) {
+    if (robotKeyboard) {
+      robotKeyboard.setKeyboardDelay(12)
+      robotKeyboard.typeString(labelText)
+      return
+    }
+    throw err
+  }
 }
 
 interface ClipboardSnapshot {
@@ -612,37 +829,38 @@ function restoreClipboardSnapshot(snapshot: ClipboardSnapshot): void {
   }
 }
 
-/** Labels we can type directly without a second clipboard paste (avoids duplicate Cmd+V). */
+/** Labels short enough to type after the pasted image. */
 function canTypeLabelDirectly(text: string): boolean {
   return text.length > 0 && text.length <= 60 && !/["\\]/.test(text)
 }
 
-async function typeLabelIntoField(labelText: string): Promise<void> {
-  const escaped = labelText.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
-  await execFileAsync('osascript', [
-    '-e',
-    `tell application "System Events" to keystroke "${escaped}"`
-  ])
-}
-
 async function performInsert(payload: ScanCompletePayload): Promise<InsertResult> {
   const { scanId, insertLabel: labelText } = payload
-  const trusted = accessibilityTrusted(false)
+  let axTrusted = macAccessibilityTrusted()
   const base: InsertResult = {
     saved: true,
     inserted: false,
-    accessibility: trusted,
+    accessibility: axTrusted,
     scanId
   }
 
+  appendInsertDebug('insert-attempt', {
+    scanId,
+    axTrusted,
+    robot: Boolean(robotKeyboard),
+    targetApp: insertTargetApp
+  })
+
   if (insertedScanIds.has(scanId)) {
     logScan('auto-insert-duplicate-ignored', scanId, { duplicate: true })
+    appendInsertDebug('insert-blocked-duplicate-scan', { scanId })
     return { ...base, duplicate: true }
   }
 
   const imageFp = fingerprintImage(payload.imageDataUrl)
   if (insertedImageFingerprints.has(imageFp)) {
     logScan('auto-insert-blocked-duplicate-image', scanId, { duplicate: true, imageFp })
+    appendInsertDebug('insert-blocked-duplicate-image', { scanId, imageFp })
     return { ...base, duplicate: true }
   }
 
@@ -652,58 +870,79 @@ async function performInsert(payload: ScanCompletePayload): Promise<InsertResult
       duplicate: true,
       msRemaining: INSERT_COOLDOWN_MS - (now - lastGlobalInsertAt)
     })
+    appendInsertDebug('insert-blocked-cooldown', { scanId })
     return { ...base, duplicate: true }
-  }
-
-  insertedScanIds.add(scanId)
-  insertedImageFingerprints.add(imageFp)
-  if (insertedScanIds.size > MAX_PROCESSED_SCANS) {
-    const oldest = insertedScanIds.values().next().value
-    if (oldest) insertedScanIds.delete(oldest)
   }
 
   const image = nativeImage.createFromDataURL(payload.imageDataUrl)
   const snapshot = saveClipboardSnapshot()
 
-  if (!trusted) {
-    if (!image.isEmpty()) clipboard.writeImage(image)
-    logScan('auto-insert-skipped-no-accessibility', scanId)
-    return { ...base, accessibility: false }
+  if (!axTrusted) {
+    axTrusted = await ensureAccessibilityPermission(true)
+  }
+  if (!axTrusted) {
+    restoreClipboardSnapshot(snapshot)
+    appendInsertDebug('insert-blocked-no-accessibility', { scanId, targetApp: insertTargetApp })
+    logScan('auto-insert-blocked-no-accessibility', scanId, { automation: automationOk })
+    notifyAccessibilityStatus()
+    return {
+      ...base,
+      accessibility: false,
+      error: 'Auto-insert needs Accessibility. Click Enable in Workbench Vision, then quit and reopen the app.'
+    }
   }
 
   try {
+    appendInsertDebug('insert-start', {
+      scanId,
+      targetApp: insertTargetApp,
+      axTrusted,
+      robot: Boolean(robotKeyboard)
+    })
+    await focusInsertTarget()
+
     if (!image.isEmpty()) {
       clipboard.writeImage(image)
-      await delay(200)
+      await delay(350)
       await pressCmdV()
       logScan('auto-insert-image-pasted', scanId)
-      await delay(500)
+      appendInsertDebug('image-pasted', { scanId })
+      await delay(700)
     }
 
-    if (canTypeLabelDirectly(labelText)) {
-      clipboard.clear()
-      await delay(80)
-      await typeLabelIntoField(labelText)
+    if (labelText && canTypeLabelDirectly(labelText)) {
+      await typeLabelIntoField(` ${labelText}`)
       logScan('auto-insert-label-typed', scanId, { insertLabel: labelText })
-    } else {
-      clipboard.clear()
+      appendInsertDebug('label-inserted', { scanId, insertLabel: labelText })
+      await delay(200)
+    } else if (labelText) {
       clipboard.writeText(labelText)
-      await delay(180)
+      await delay(250)
       await pressCmdV()
       logScan('auto-insert-label-pasted', scanId, { insertLabel: labelText })
-      await delay(250)
+      appendInsertDebug('label-inserted', { scanId, insertLabel: labelText })
+      await delay(200)
     }
 
     restoreClipboardSnapshot(snapshot)
+    insertedScanIds.add(scanId)
+    insertedImageFingerprints.add(imageFp)
+    if (insertedScanIds.size > MAX_PROCESSED_SCANS) {
+      const oldest = insertedScanIds.values().next().value
+      if (oldest) insertedScanIds.delete(oldest)
+    }
     lastGlobalInsertAt = Date.now()
     diskMarkInserted()
+    markAccessibilityWorking()
     logScan('auto-insert-done', scanId, { inserted: true, insertLabel: labelText })
-    return { ...base, inserted: true }
+    appendInsertDebug('insert-done', { scanId })
+    return { ...base, inserted: true, accessibility: true }
   } catch (err) {
     restoreClipboardSnapshot(snapshot)
     const message = err instanceof Error ? err.message : 'Failed to insert into the active field.'
-    logScan('auto-insert-error', scanId, { error: message })
-    return { ...base, error: message }
+    appendInsertDebug('insert-error', { scanId, error: message, axTrusted })
+    logScan('auto-insert-error', scanId, { error: message, axTrusted })
+    return { ...base, accessibility: axTrusted, error: message }
   }
 }
 
@@ -852,6 +1091,7 @@ function toggleOverlay(source: 'hotkey' | 'tray' | 'reload' = 'hotkey'): void {
   }
   if (!canSendOverlayToggle(source)) return
   lastOverlayToggleAt = now
+  captureInsertTargetApp()
   overlayScanActive = true
   logScan('overlay-toggle', 'system', { source, packaged: !isDev })
 
@@ -1113,20 +1353,33 @@ function registerIpc(): void {
 
   ipcMain.handle(IPC.openMain, async () => showMainWindow())
 
-  ipcMain.handle(IPC.getAccessibility, async () => getAccessibilityStatus())
+  ipcMain.handle(IPC.getAccessibility, async () => getPermissionStatus())
 
   ipcMain.handle(IPC.recheckAccessibility, async () => {
-    const trusted = getAccessibilityStatus()
-    notifyAccessibilityStatus()
-    return trusted
+    const status = await getPermissionStatus()
+    mainWindow?.webContents.send(IPC.accessibilityUpdated, status)
+    return status
   })
 
   ipcMain.handle(IPC.requestAccessibility, async () => {
-    const trusted = accessibilityTrusted(true)
-    if (trusted) markAccessibilityWorking()
-    else notifyAccessibilityStatus()
-    return trusted
+    openAccessibilitySettings()
+    await ensureAccessibilityPermission(true)
+    let status = await getPermissionStatus()
+    if (status.accessibility && !status.automation) {
+      openAutomationSettings()
+      await refreshAutomationStatus()
+      status = await getPermissionStatus()
+    }
+    mainWindow?.webContents.send(IPC.accessibilityUpdated, status)
+    return status
   })
+
+  ipcMain.handle(IPC.getBuildInfo, async (): Promise<BuildInfo> => ({
+    buildId: BUILD_ID,
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    exePath: app.getPath('exe')
+  }))
 }
 
 function registerGlobalShortcut(): void {
@@ -1153,6 +1406,8 @@ if (!gotSingleInstanceLock) {
 }
 
 app.whenReady().then(() => {
+  robotKeyboard = loadRobotKeyboard()
+
   if (process.platform === 'darwin') {
     // Show in the Dock (with our app icon) in addition to the menu bar.
     // Forced explicitly so a stale Launch Services "UIElement" registration
@@ -1164,6 +1419,13 @@ app.whenReady().then(() => {
 
   loadUserEnv()
   ensureStorage()
+  appendInsertDebug('app-start', {
+    buildId: BUILD_ID,
+    packaged: app.isPackaged,
+    exe: app.getPath('exe'),
+    robot: Boolean(robotKeyboard),
+    axTrusted: macAccessibilityTrusted()
+  })
   setupMediaPermissions()
   void ensureCameraAccess()
   registerIpc()
@@ -1171,6 +1433,7 @@ app.whenReady().then(() => {
   ensureOverlay() // persistent standby pill, alive for the whole session
   setupTray()
   registerGlobalShortcut()
+  void refreshAutomationStatus().then(() => notifyAccessibilityStatus())
 
   app.on('activate', () => {
     showMainWindow()

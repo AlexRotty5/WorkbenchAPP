@@ -828,3 +828,12 @@ kbd {
   line-height: 1.45;
   color: var(--text-dim);
 }
+
+.app-footer {
+  margin-top: auto;
+  padding: 16px 24px 20px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-dim);
+  border-top: 1px solid var(--border);
+}

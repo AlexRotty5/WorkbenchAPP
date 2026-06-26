@@ -60,6 +60,21 @@ export interface InsertResult {
   error?: string
 }
 
+/** Auto-insert permission state shown in the main window banner. */
+export interface AutoInsertPermissionStatus {
+  ready: boolean
+  accessibility: boolean
+  automation: boolean
+  hint?: string
+}
+
+export interface BuildInfo {
+  buildId: string
+  version: string
+  packaged: boolean
+  exePath: string
+}
+
 export const IPC = {
   // overlay -> main (invoke) — single atomic scan pipeline
   runScan: 'run-scan',
@@ -75,6 +90,7 @@ export const IPC = {
   getAccessibility: 'get-accessibility',
   requestAccessibility: 'request-accessibility',
   recheckAccessibility: 'recheck-accessibility',
+  getBuildInfo: 'get-build-info',
   // overlay -> main (hover/launch)
   setMouseIgnore: 'set-mouse-ignore',
   openMain: 'open-main',
