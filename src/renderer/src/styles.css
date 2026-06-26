@@ -357,6 +357,17 @@ kbd {
   flex-shrink: 0;
 }
 
+.access-banner-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.access-banner--unknown {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
 .registry-header {
   display: flex;
   align-items: center;
@@ -479,7 +490,7 @@ kbd {
   display: flex;
   align-items: flex-end;
   justify-content: center;
-  padding-bottom: 10px;
+  padding-bottom: 0;
 }
 
 .pill {
@@ -509,7 +520,7 @@ kbd {
   display: inline-flex;
   align-items: flex-end;
   justify-content: center;
-  padding: 18px 34px 4px;
+  padding: 18px 34px 0;
 }
 
 /* Resting state: a tiny, quiet, black bar. */

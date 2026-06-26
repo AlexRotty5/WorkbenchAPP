@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { JSX } from 'react'
+import { newScanId, scanLog } from '../../shared/scanLog'
 
 type Mode = 'standby' | 'active'
 type Phase = 'scanning' | 'analyzing' | 'success' | 'error'
@@ -16,6 +17,8 @@ const HINTS_AFTER_MS = 2600
 const GIVE_UP_MS = 12000
 const LOW_LIGHT = 55
 const COLLAPSE_MS = 240
+
+const isPackaged = !import.meta.env.DEV
 
 const CameraIcon = (): JSX.Element => (
   <svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden>
@@ -47,19 +50,29 @@ function OverlayApp(): JSX.Element {
 
   const prevGrayRef = useRef<Uint8ClampedArray | null>(null)
   const stableCountRef = useRef(0)
-  const requireMotionRef = useRef(false)
   const busyRef = useRef(false)
   const doneRef = useRef(false)
-  const activeRef = useRef(false)
+  /** True while a scan session is active (hotkey → standby). */
+  const isScanningRef = useRef(false)
   const mountedRef = useRef(true)
+  /** Locked after the first successful capture+insert for this session. */
+  const hasCapturedThisSessionRef = useRef(false)
+  /** True while an AI runScan call is in flight for this session. */
+  const analysisInFlightRef = useRef(false)
+
+  const currentScanSessionIdRef = useRef('')
+  const sessionGenRef = useRef(0)
+  const startCameraGenRef = useRef(0)
 
   const lastMotionRef = useRef(0)
   const showHintsRef = useRef(false)
   const lastCoachRef = useRef('')
 
-  const loopRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const failTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const loopRef = useRef<number | null>(null)
+  const intervalIdsRef = useRef<Set<number>>(new Set())
+  const warmupTimerRef = useRef<number | null>(null)
+  const hintTimerRef = useRef<number | null>(null)
+  const failTimerRef = useRef<number | null>(null)
 
   const [mode, setMode] = useState<Mode>('standby')
   const [phase, setPhase] = useState<Phase>('scanning')
@@ -68,6 +81,19 @@ function OverlayApp(): JSX.Element {
   const [errorText, setErrorText] = useState('')
   const [collapsing, setCollapsing] = useState(false)
   const [hover, setHover] = useState(false)
+
+  const log = useCallback((phase: string, extra: Record<string, unknown> = {}) => {
+    scanLog(phase, {
+      scanId: currentScanSessionIdRef.current,
+      sessionGen: sessionGenRef.current,
+      packaged: isPackaged,
+      ...extra
+    })
+  }, [])
+
+  const isActiveSession = useCallback((sessionGen: number): boolean => {
+    return mountedRef.current && sessionGen === sessionGenRef.current
+  }, [])
 
   const stopCamera = useCallback(() => {
     const stream = streamRef.current
@@ -78,23 +104,50 @@ function OverlayApp(): JSX.Element {
     if (videoRef.current) videoRef.current.srcObject = null
   }, [])
 
-  const clearTimers = useCallback(() => {
-    if (loopRef.current) clearInterval(loopRef.current)
-    if (hintTimerRef.current) clearTimeout(hintTimerRef.current)
-    if (failTimerRef.current) clearTimeout(failTimerRef.current)
+  const pauseSampleLoop = useCallback(() => {
+    for (const id of intervalIdsRef.current) clearInterval(id)
+    intervalIdsRef.current.clear()
+    if (loopRef.current !== null) clearInterval(loopRef.current)
     loopRef.current = null
-    hintTimerRef.current = null
-    failTimerRef.current = null
   }, [])
 
-  // Collapse the active pill back into the standby pill (no window teardown).
+  const stopAllCapture = useCallback(() => {
+    pauseSampleLoop()
+    if (warmupTimerRef.current !== null) clearTimeout(warmupTimerRef.current)
+    if (hintTimerRef.current !== null) clearTimeout(hintTimerRef.current)
+    if (failTimerRef.current !== null) clearTimeout(failTimerRef.current)
+    warmupTimerRef.current = null
+    hintTimerRef.current = null
+    failTimerRef.current = null
+    stopCamera()
+  }, [pauseSampleLoop, stopCamera])
+
+  const resumeSampleLoop = useCallback(
+    (sessionGen: number) => {
+      if (!isActiveSession(sessionGen)) return
+      if (
+        hasCapturedThisSessionRef.current ||
+        doneRef.current ||
+        analysisInFlightRef.current ||
+        busyRef.current
+      ) {
+        return
+      }
+      if (loopRef.current !== null) return
+      const id = window.setInterval(() => sampleRef.current(sessionGen), SAMPLE_INTERVAL_MS)
+      intervalIdsRef.current.add(id)
+      loopRef.current = id
+    },
+    [isActiveSession]
+  )
+
   const returnToStandby = useCallback((delayMs: number) => {
     window.setTimeout(() => {
       if (!mountedRef.current) return
       setCollapsing(true)
       window.setTimeout(() => {
         if (!mountedRef.current) return
-        activeRef.current = false
+        isScanningRef.current = false
         setMode('standby')
         setCollapsing(false)
         setPhase('scanning')
@@ -102,7 +155,11 @@ function OverlayApp(): JSX.Element {
         setSuccessLabel('')
         setErrorText('')
         setHover(false)
+        busyRef.current = false
+        hasCapturedThisSessionRef.current = false
+        analysisInFlightRef.current = false
         void window.api.setMouseIgnore(true)
+        void window.api.scanSessionEnded(currentScanSessionIdRef.current)
       }, COLLAPSE_MS)
     }, delayMs)
   }, [])
@@ -119,51 +176,31 @@ function OverlayApp(): JSX.Element {
     return canvas.toDataURL('image/jpeg', 0.85)
   }, [])
 
-  const runDetection = useCallback(async () => {
-    if (busyRef.current || doneRef.current) return
-    busyRef.current = true
-    setPhase('analyzing')
-
-    const dataUrl = captureFullFrame()
-    if (!dataUrl) {
-      busyRef.current = false
-      setPhase('scanning')
-      return
-    }
-
-    const result = await window.api.detectObject(dataUrl)
-    if (!mountedRef.current || doneRef.current) return
-
-    if (result.error) {
+  const finishWithError = useCallback(
+    (message: string, delayMs: number, sessionGen: number) => {
+      if (!isActiveSession(sessionGen)) return
       doneRef.current = true
-      clearTimers()
-      stopCamera()
+      stopAllCapture()
       setPhase('error')
-      setErrorText('Scan failed')
-      returnToStandby(1400)
-      return
-    }
+      setErrorText(message)
+      returnToStandby(delayMs)
+    },
+    [isActiveSession, returnToStandby, stopAllCapture]
+  )
 
-    if (!result.found) {
-      requireMotionRef.current = true
-      stableCountRef.current = 0
-      prevGrayRef.current = null
-      busyRef.current = false
-      setPhase('scanning')
-      return
-    }
-
-    // Found — finalize, insert, and settle back to standby.
-    doneRef.current = true
-    clearTimers()
-    stopCamera()
-    setSuccessLabel(result.label)
-    setPhase('success')
-
-    await window.api.completeScan({ imageDataUrl: dataUrl, label: result.label })
-    if (!mountedRef.current) return
-    returnToStandby(300)
-  }, [captureFullFrame, clearTimers, returnToStandby, stopCamera])
+  const finishWithSuccess = useCallback(
+    (label: string, sessionGen: number) => {
+      if (!isActiveSession(sessionGen) || doneRef.current) return
+      hasCapturedThisSessionRef.current = true
+      doneRef.current = true
+      stopAllCapture()
+      setSuccessLabel(label)
+      setPhase('success')
+      log('scan-session-success-locked')
+      returnToStandby(150)
+    },
+    [isActiveSession, log, returnToStandby, stopAllCapture]
+  )
 
   const updateCoach = useCallback((brightness: number) => {
     if (!showHintsRef.current) return
@@ -177,103 +214,277 @@ function OverlayApp(): JSX.Element {
     }
   }, [])
 
-  const sample = useCallback(() => {
-    if (busyRef.current || doneRef.current) return
-    const video = videoRef.current
-    const canvas = sampleCanvasRef.current
-    if (!video || !canvas || video.videoWidth === 0) return
+  const tryAnalyzeFrame = useCallback(
+    async (sessionGen: number) => {
+      if (!isActiveSession(sessionGen)) {
+        log('scan-ignored-stale-session', { sessionGen })
+        return
+      }
+      if (
+        busyRef.current ||
+        doneRef.current ||
+        hasCapturedThisSessionRef.current ||
+        analysisInFlightRef.current
+      ) {
+        log('scan-ignored-locked', {
+          busy: busyRef.current,
+          done: doneRef.current,
+          hasCaptured: hasCapturedThisSessionRef.current,
+          analysisInFlight: analysisInFlightRef.current,
+          duplicate: true
+        })
+        return
+      }
 
-    const ctx = canvas.getContext('2d', { willReadFrequently: true })
-    if (!ctx) return
-    ctx.drawImage(video, 0, 0, SAMPLE_W, SAMPLE_H)
-    const { data } = ctx.getImageData(0, 0, SAMPLE_W, SAMPLE_H)
-
-    const gray = new Uint8ClampedArray(SAMPLE_W * SAMPLE_H)
-    let brightnessSum = 0
-    for (let i = 0, j = 0; i < data.length; i += 4, j++) {
-      const g = (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000
-      gray[j] = g
-      brightnessSum += g
-    }
-    const brightness = brightnessSum / gray.length
-
-    const prev = prevGrayRef.current
-    prevGrayRef.current = gray
-    if (!prev) return
-
-    let sum = 0
-    for (let k = 0; k < gray.length; k++) sum += Math.abs(gray[k] - prev[k])
-    const meanDiff = sum / gray.length
-
-    if (meanDiff > MOTION_THRESHOLD) {
-      lastMotionRef.current = Date.now()
-      requireMotionRef.current = false
+      busyRef.current = true
+      analysisInFlightRef.current = true
       stableCountRef.current = 0
+      pauseSampleLoop()
+      setSuccessLabel('')
+      setPhase('analyzing')
+
+      const dataUrl = captureFullFrame()
+      if (!dataUrl) {
+        log('capture-failed')
+        analysisInFlightRef.current = false
+        busyRef.current = false
+        resumeSampleLoop(sessionGen)
+        return
+      }
+
+      const scanId = currentScanSessionIdRef.current
+      log('capture', { bytes: dataUrl.length })
+      log('run-scan-send')
+
+      const result = await window.api.runScan({ scanId, dataUrl })
+
+      analysisInFlightRef.current = false
+      busyRef.current = false
+
+      if (!isActiveSession(sessionGen)) {
+        log('run-scan-result-ignored-stale-session', { duplicate: result.duplicate })
+        return
+      }
+
+      if (hasCapturedThisSessionRef.current) {
+        log('run-scan-result-ignored-after-success', { duplicate: true })
+        return
+      }
+
+      log('run-scan-result', {
+        ok: result.ok,
+        found: result.found,
+        duplicate: result.duplicate,
+        retryable: result.retryable,
+        label: result.label,
+        insertLabel: result.insertLabel,
+        inserted: result.inserted,
+        error: result.error
+      })
+
+      if (result.ok && result.found) {
+        finishWithSuccess(result.insertLabel || result.label, sessionGen)
+        return
+      }
+
+      if (result.duplicate) {
+        doneRef.current = true
+        hasCapturedThisSessionRef.current = true
+        stopAllCapture()
+        returnToStandby(150)
+        return
+      }
+
+      if (result.error) {
+        log('scan-error', { error: result.error })
+        finishWithError('Scan failed', 1400, sessionGen)
+        return
+      }
+
+      if (!result.found) {
+        if (result.retryable) {
+          log('scan-not-found-retry')
+          prevGrayRef.current = null
+          stableCountRef.current = 0
+          setSuccessLabel('')
+          setPhase('scanning')
+          resumeSampleLoop(sessionGen)
+          return
+        }
+        log('scan-not-found')
+        finishWithError("Couldn't identify object", 1400, sessionGen)
+        return
+      }
+    },
+    [
+      captureFullFrame,
+      finishWithError,
+      finishWithSuccess,
+      isActiveSession,
+      log,
+      pauseSampleLoop,
+      resumeSampleLoop,
+      returnToStandby,
+      stopAllCapture
+    ]
+  )
+
+  const sampleRef = useRef<(sessionGen: number) => void>(() => undefined)
+
+  const sample = useCallback(
+    (sessionGen: number) => {
+      if (!isActiveSession(sessionGen)) return
+      if (
+        busyRef.current ||
+        doneRef.current ||
+        hasCapturedThisSessionRef.current ||
+        analysisInFlightRef.current
+      ) {
+        return
+      }
+
+      const video = videoRef.current
+      const canvas = sampleCanvasRef.current
+      if (!video || !canvas || video.videoWidth === 0) return
+
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })
+      if (!ctx) return
+      ctx.drawImage(video, 0, 0, SAMPLE_W, SAMPLE_H)
+      const { data } = ctx.getImageData(0, 0, SAMPLE_W, SAMPLE_H)
+
+      const gray = new Uint8ClampedArray(SAMPLE_W * SAMPLE_H)
+      let brightnessSum = 0
+      for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+        const g = (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000
+        gray[j] = g
+        brightnessSum += g
+      }
+      const brightness = brightnessSum / gray.length
+
+      const prev = prevGrayRef.current
+      prevGrayRef.current = gray
+      if (!prev) return
+
+      let sum = 0
+      for (let k = 0; k < gray.length; k++) sum += Math.abs(gray[k] - prev[k])
+      const meanDiff = sum / gray.length
+
+      if (meanDiff > MOTION_THRESHOLD) {
+        lastMotionRef.current = Date.now()
+        stableCountRef.current = 0
+        updateCoach(brightness)
+        return
+      }
+
       updateCoach(brightness)
+
+      if (meanDiff < STILL_THRESHOLD) stableCountRef.current += 1
+      else stableCountRef.current = 0
+
+      if (stableCountRef.current >= STABLE_FRAMES_NEEDED) {
+        stableCountRef.current = 0
+        void tryAnalyzeFrame(sessionGen)
+      }
+    },
+    [isActiveSession, tryAnalyzeFrame, updateCoach]
+  )
+
+  sampleRef.current = sample
+
+  const startCamera = useCallback(
+    async (sessionGen: number, cameraGen: number) => {
+      stopAllCapture()
+
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera API unavailable')
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+
+        if (
+          !isActiveSession(sessionGen) ||
+          doneRef.current ||
+          hasCapturedThisSessionRef.current ||
+          cameraGen !== startCameraGenRef.current
+        ) {
+          stream.getTracks().forEach((t) => t.stop())
+          log('camera-stale-session-discarded', { sessionGen, cameraGen })
+          return
+        }
+
+        streamRef.current = stream
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream
+          await videoRef.current.play().catch(() => undefined)
+        }
+
+        if (cameraGen !== startCameraGenRef.current || !isActiveSession(sessionGen)) {
+          stream.getTracks().forEach((t) => t.stop())
+          return
+        }
+
+        warmupTimerRef.current = window.setTimeout(() => {
+          if (
+            !isActiveSession(sessionGen) ||
+            doneRef.current ||
+            hasCapturedThisSessionRef.current ||
+            analysisInFlightRef.current ||
+            cameraGen !== startCameraGenRef.current
+          ) {
+            return
+          }
+          const id = window.setInterval(() => sample(sessionGen), SAMPLE_INTERVAL_MS)
+          intervalIdsRef.current.add(id)
+          loopRef.current = id
+        }, WARMUP_MS)
+
+        hintTimerRef.current = window.setTimeout(() => {
+          if (!isActiveSession(sessionGen)) return
+          showHintsRef.current = true
+        }, HINTS_AFTER_MS)
+
+        failTimerRef.current = window.setTimeout(() => {
+          if (
+            doneRef.current ||
+            hasCapturedThisSessionRef.current ||
+            analysisInFlightRef.current ||
+            !isActiveSession(sessionGen)
+          ) {
+            return
+          }
+          log('scan-timeout')
+          finishWithError("Couldn't capture", 1300, sessionGen)
+        }, GIVE_UP_MS)
+      } catch (err) {
+        if (!isActiveSession(sessionGen)) return
+        const message = err instanceof Error ? err.message : 'Camera unavailable'
+        log('camera-error', { error: message })
+        finishWithError(message.length > 40 ? 'Camera unavailable' : message, 1500, sessionGen)
+      }
+    },
+    [finishWithError, isActiveSession, log, sample, stopAllCapture]
+  )
+
+  const activate = useCallback(async () => {
+    if (isScanningRef.current) {
+      log('activate-ignored-scan-in-progress', { duplicate: true })
       return
     }
 
-    updateCoach(brightness)
-    if (requireMotionRef.current) return
+    sessionGenRef.current += 1
+    startCameraGenRef.current += 1
+    const sessionGen = sessionGenRef.current
+    const cameraGen = startCameraGenRef.current
+    currentScanSessionIdRef.current = newScanId()
 
-    if (meanDiff < STILL_THRESHOLD) stableCountRef.current += 1
-    else stableCountRef.current = 0
-
-    if (stableCountRef.current >= STABLE_FRAMES_NEEDED) void runDetection()
-  }, [runDetection, updateCoach])
-
-  const startCamera = useCallback(async () => {
-    try {
-      if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera API unavailable')
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
-      if (doneRef.current) {
-        stream.getTracks().forEach((t) => t.stop())
-        return
-      }
-      streamRef.current = stream
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream
-        await videoRef.current.play().catch(() => undefined)
-      }
-
-      window.setTimeout(() => {
-        if (!mountedRef.current || doneRef.current) return
-        loopRef.current = setInterval(() => sample(), SAMPLE_INTERVAL_MS)
-      }, WARMUP_MS)
-
-      hintTimerRef.current = setTimeout(() => {
-        showHintsRef.current = true
-      }, HINTS_AFTER_MS)
-
-      failTimerRef.current = setTimeout(() => {
-        if (doneRef.current || !mountedRef.current) return
-        doneRef.current = true
-        clearTimers()
-        stopCamera()
-        setPhase('error')
-        setErrorText("Couldn't capture")
-        returnToStandby(1300)
-      }, GIVE_UP_MS)
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Camera unavailable'
-      doneRef.current = true
-      clearTimers()
-      setPhase('error')
-      setErrorText(message.length > 40 ? 'Camera unavailable' : message)
-      returnToStandby(1500)
-    }
-  }, [clearTimers, returnToStandby, sample, stopCamera])
-
-  const activate = useCallback(() => {
-    if (activeRef.current) return
-    activeRef.current = true
+    isScanningRef.current = true
     doneRef.current = false
     busyRef.current = false
-    requireMotionRef.current = false
+    hasCapturedThisSessionRef.current = false
+    analysisInFlightRef.current = false
     stableCountRef.current = 0
     prevGrayRef.current = null
     showHintsRef.current = false
     lastCoachRef.current = ''
+
     setCoachText('')
     setSuccessLabel('')
     setErrorText('')
@@ -282,33 +493,43 @@ function OverlayApp(): JSX.Element {
     void window.api.setMouseIgnore(true)
     setPhase('scanning')
     setMode('active')
-    void startCamera()
-  }, [startCamera])
 
-  const cancelActive = useCallback(() => {
-    if (!activeRef.current) return
-    doneRef.current = true
-    clearTimers()
-    stopCamera()
-    returnToStandby(0)
-  }, [clearTimers, returnToStandby, stopCamera])
+    log('scan-start', { sessionGen, trigger: 'overlay-toggle' })
+
+    const session = await window.api.scanSessionStarted(currentScanSessionIdRef.current)
+    if (!session.ok) {
+      log('scan-session-rejected', { duplicate: session.duplicate })
+      isScanningRef.current = false
+      setMode('standby')
+      void window.api.scanSessionEnded(currentScanSessionIdRef.current)
+      return
+    }
+
+    void startCamera(sessionGen, cameraGen)
+  }, [log, startCamera])
+
+  const activateRef = useRef(activate)
+  activateRef.current = activate
 
   useEffect(() => {
     mountedRef.current = true
     const offToggle = window.api.onOverlayToggle(() => {
-      if (activeRef.current) cancelActive()
-      else activate()
+      if (isScanningRef.current) {
+        log('toggle-ignored-scan-in-progress', { duplicate: true })
+        return
+      }
+      activateRef.current()
     })
-    const onBeforeUnload = (): void => stopCamera()
+    const onBeforeUnload = (): void => stopAllCapture()
     window.addEventListener('beforeunload', onBeforeUnload)
     return () => {
       mountedRef.current = false
+      sessionGenRef.current += 1
       offToggle()
       window.removeEventListener('beforeunload', onBeforeUnload)
-      clearTimers()
-      stopCamera()
+      stopAllCapture()
     }
-  }, [activate, cancelActive, clearTimers, stopCamera])
+  }, [log, stopAllCapture])
 
   const onStandbyEnter = (): void => {
     setHover(true)

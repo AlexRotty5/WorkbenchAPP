@@ -17,12 +17,12 @@ function timeAgo(ts: number): string {
 
 function App(): JSX.Element {
   const [scans, setScans] = useState<ScanRecord[]>([])
-  const [accessible, setAccessible] = useState<boolean>(true)
+  const [accessible, setAccessible] = useState<boolean | null>(null)
   const [copiedId, setCopiedId] = useState<string | null>(null)
 
   useEffect(() => {
     void window.api.getScans().then(setScans)
-    void window.api.getAccessibility().then(setAccessible)
+    void window.api.recheckAccessibility().then(setAccessible)
 
     const offScans = window.api.onScansUpdated(setScans)
     const offAccess = window.api.onAccessibilityUpdated(setAccessible)
@@ -52,6 +52,10 @@ function App(): JSX.Element {
     setAccessible(await window.api.requestAccessibility())
   }
 
+  async function recheckAccessibility(): Promise<void> {
+    setAccessible(await window.api.recheckAccessibility())
+  }
+
   return (
     <div className="app">
       <header className="app-header">
@@ -75,16 +79,30 @@ function App(): JSX.Element {
         it and drops the image plus a short label straight into your active field.
       </div>
 
-      {!accessible && (
+      {accessible === null && (
+        <div className="access-banner access-banner--unknown">
+          <div>Checking auto-insert permissions…</div>
+          <button className="btn ghost" onClick={() => void recheckAccessibility()}>
+            Recheck
+          </button>
+        </div>
+      )}
+
+      {accessible === false && (
         <div className="access-banner">
           <div>
             <strong>Auto-insert is off.</strong> Grant Accessibility permission so scans can be
             typed into other apps. Until then, the scanned image is copied to your clipboard so you
             can paste it manually.
           </div>
-          <button className="btn primary" onClick={() => void enableAccessibility()}>
-            Enable
-          </button>
+          <div className="access-banner-actions">
+            <button className="btn primary" onClick={() => void enableAccessibility()}>
+              Enable
+            </button>
+            <button className="btn ghost" onClick={() => void recheckAccessibility()}>
+              Recheck
+            </button>
+          </div>
         </div>
       )}
 

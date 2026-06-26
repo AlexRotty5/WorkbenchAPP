@@ -1,24 +1,40 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { IPC } from '../shared/types'
 import type {
-  DetectResult,
   InsertResult,
+  RunScanPayload,
+  RunScanResult,
   ScanCompletePayload,
-  ScanRecord
+  ScanRecord,
+  ScanSessionResult
 } from '../shared/types'
+
+// Single IPC listener for overlay hotkey — prevents duplicate handlers on remount/HMR.
+let overlayToggleHandler: (() => void) | null = null
+ipcRenderer.on(IPC.overlayToggle, () => {
+  overlayToggleHandler?.()
+})
 
 const api = {
   // ----- Overlay (scan flow) -----
-  detectObject(dataUrl: string): Promise<DetectResult> {
-    return ipcRenderer.invoke(IPC.detectObject, dataUrl)
+  /** One capture → one AI call → one card → one insert. */
+  runScan(payload: RunScanPayload): Promise<RunScanResult> {
+    return ipcRenderer.invoke(IPC.runScan, payload)
+  },
+  scanSessionStarted(scanId: string): Promise<ScanSessionResult> {
+    return ipcRenderer.invoke(IPC.scanSessionStarted, scanId)
+  },
+  scanSessionEnded(scanId?: string): Promise<{ ok: boolean }> {
+    return ipcRenderer.invoke(IPC.scanSessionEnded, scanId)
   },
   completeScan(payload: ScanCompletePayload): Promise<InsertResult> {
     return ipcRenderer.invoke(IPC.completeScan, payload)
   },
   onOverlayToggle(cb: () => void): () => void {
-    const listener = (): void => cb()
-    ipcRenderer.on(IPC.overlayToggle, listener)
-    return () => ipcRenderer.removeListener(IPC.overlayToggle, listener)
+    overlayToggleHandler = cb
+    return () => {
+      if (overlayToggleHandler === cb) overlayToggleHandler = null
+    }
   },
   setMouseIgnore(ignore: boolean): Promise<void> {
     return ipcRenderer.invoke(IPC.setMouseIgnore, ignore)
@@ -52,6 +68,9 @@ const api = {
   },
   requestAccessibility(): Promise<boolean> {
     return ipcRenderer.invoke(IPC.requestAccessibility)
+  },
+  recheckAccessibility(): Promise<boolean> {
+    return ipcRenderer.invoke(IPC.recheckAccessibility)
   },
   onAccessibilityUpdated(cb: (trusted: boolean) => void): () => void {
     const listener = (_e: unknown, trusted: boolean): void => cb(trusted)
